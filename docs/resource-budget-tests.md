@@ -17,6 +17,12 @@ To run the same budget check locally after dependencies are installed:
 npm test -- --runInBand src/search/asset-search.resource-budget.spec.ts
 ```
 
+The spec had stopped loading: an import cycle (`portfolio-asset.entity` ->
+`portfolio.entity` -> `transaction.entity` -> `portfolio-asset.entity`) left
+the `Chain` enum undefined when `transaction.entity` ran its decorators. `Chain`
+now lives in `entities/chain.enum.ts` and is re-exported from
+`portfolio-asset.entity`, so existing imports are unchanged.
+
 These checks enforce row-count/query-count ceilings, not wall-clock latency,
 heap bytes, PostgreSQL plan quality, or Elasticsearch cost. The repository does
 not currently provide a stable database fixture for those measurements. The
@@ -38,3 +44,51 @@ real deployment should also monitor query latency and inspect `EXPLAIN
 - To roll back this contribution, revert the targeted workflow step, spec,
   documentation, and exported candidate-window constant. The change does not
   alter public API schemas, persisted data, or runtime defaults.
+
+## Worst-case input budgets (#345)
+
+`src/testing/worst-case-inputs.resource-budget.spec.ts` adds deterministic
+budgets for code that sits on every request, log line or ledger verification
+and receives caller- or chain-controlled input. Each budget counts work, using
+property-read counters and proxies, and bounds output size. None of them
+measures wall-clock time, so they do not flake on slow CI runners.
+
+| Path | Worst-case input | Ceiling | Constant |
+| --- | --- | ---: | --- |
+| Log/body sanitisation | 50,000-key object | 100 values visited; the rest is summarised as `[TRUNCATED_KEYS]: n` | `MAX_OBJECT_KEYS` |
+| Log/body sanitisation | 1,000,000-element array | 50 elements read | `MAX_ARRAY_LENGTH` |
+| Log/body sanitisation | 10,000 levels of nesting | depth 8, no stack overflow | `MAX_DEPTH` |
+| Log/body sanitisation | 5 MB string | 4,096 chars + marker | `MAX_STRING_LENGTH` |
+| Error messages | 5 MB pathological text (credential pairs, hex run, JWT and seed near-misses) | 8,192 chars + marker; regexes scan at most 8,192 chars | `MAX_ERROR_MESSAGE_LENGTH` |
+| Request URLs | 1 MB query string | cut on a parameter boundary | `MAX_STRING_LENGTH` |
+| Telemetry redaction | 100,000 levels of nesting | depth 32, no stack overflow (previously threw `RangeError`) | `MAX_REDACTION_DEPTH` |
+| Correlation header | 16 MB `x-correlation-id` | O(1) length check before the pattern; replaced by a UUID | `MAX_CORRELATION_ID_LENGTH` |
+| Correlation header | 10,000 repeated values | the first value only | - |
+| Oracle event scan | 10,000 events in one transaction | refused with `EVENT_SCAN_LIMIT` before any event is read | `MAX_CONTRACT_EVENTS_PER_TRANSACTION` (100) |
+| Oracle event decode | 10,000-field data tuple | refused with `EVENT_DATA_TOO_LARGE` before any element is read | `MAX_ORACLE_EVENT_DATA_FIELDS` (16) |
+
+The spec found one real defect while it was being written: truncating
+*before* redacting let redaction grow the output past the cap, and a secret cut
+at the boundary could leave its visible half behind, no longer matching the
+pattern. `redactBounded` now drops the token that straddles the cut, redacts
+what remains, then caps the output. A dedicated case places a JWT at several
+offsets around the cap.
+
+Run locally:
+
+```sh
+npm test -- --runInBand resource-budget
+```
+
+### Edge cases and recovery
+
+- Truncated log values end in `...[TRUNCATED n chars]`, and wide objects carry
+  a `[TRUNCATED_KEYS]` count. Log queries that need the full payload should use
+  the source record, not the log line.
+- An unbroken token longer than the cap (no whitespace) is replaced entirely
+  by `[REDACTED]`, because it cannot be shown safely in part.
+- `EVENT_SCAN_LIMIT` and `EVENT_DATA_TOO_LARGE` are retryable, so the
+  submission is deferred, not rejected. If a legitimate contract release ever
+  exceeds them, raise the constant together with this table and the spec.
+- Rollback: revert the constants and spec. No data or API schema depends on
+  them.
