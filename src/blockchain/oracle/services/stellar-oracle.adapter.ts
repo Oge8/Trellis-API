@@ -12,6 +12,11 @@ import {
 } from "@stellar/stellar-sdk";
 import { createHash } from "crypto";
 import { SubmissionReference } from "./submission-history.service";
+import {
+  DecodedOracleEvent,
+  OracleContractEventError,
+  decodeOracleTransactionEvents,
+} from "../events/oracle-contract-events";
 
 export class OracleVerificationError extends Error {
   constructor(
@@ -278,9 +283,13 @@ export class StellarOracleAdapter {
     return { latestLedger, instance, code, history };
   }
 
-  async verify(
-    submission: SubmissionReference,
-  ): Promise<{ hash: string; timestamp: number; ledger: number }> {
+  async verify(submission: SubmissionReference): Promise<{
+    hash: string;
+    timestamp: number;
+    ledger: number;
+    /** Present only when RPC returned the transaction's contract events. */
+    contractEvent?: DecodedOracleEvent;
+  }> {
     await this.assertNetwork();
     const transaction = await this.request(() =>
       this.server.getTransaction(submission.transactionHash),
@@ -371,10 +380,59 @@ export class StellarOracleAdapter {
         "Ledger submitter or payload hash differs from the registered submission",
       );
     }
+    const contractEvent = this.verifyPriceEvent(
+      (transaction as rpc.Api.GetSuccessfulTransactionResponse).events
+        ?.contractEventsXdr,
+      args,
+    );
     return {
       hash: hashOracleArguments(args),
       timestamp: Number(transaction.createdAt) * 1000,
       ledger: transaction.ledger,
+      ...(contractEvent && { contractEvent }),
     };
+  }
+
+  /**
+   * Cross-checks the `("oracle", "price")` event against the invocation (#348).
+   * RPC servers or protocols that return no contract events keep the previous
+   * argument-only verification; once events are present they must decode
+   * against a registered schema and agree with the arguments.
+   *
+   * Schema drift is retryable: the submission is deferred, not rejected, so it
+   * verifies once a decoder that knows the new contract release is deployed.
+   * Only a decoded event that contradicts the invocation is a hard mismatch.
+   */
+  private verifyPriceEvent(
+    contractEventsXdr: xdr.ContractEvent[][] | undefined,
+    args: xdr.ScVal[],
+  ): DecodedOracleEvent | undefined {
+    let events: ReturnType<typeof decodeOracleTransactionEvents>;
+    try {
+      events = decodeOracleTransactionEvents(contractEventsXdr, this.contract);
+    } catch (error) {
+      if (error instanceof OracleContractEventError)
+        throw new OracleVerificationError(error.code, error.message, true);
+      throw error;
+    }
+    if (!events.available) return undefined;
+    const prices = events.decoded.filter((event) => event.kind === "price");
+    if (prices.length !== 1)
+      throw new OracleVerificationError(
+        "CONTRACT_EVENT_MISSING",
+        `Expected exactly one oracle price event from the configured contract, found ${prices.length}`,
+        true,
+      );
+    const [event] = prices;
+    if (
+      event.fields.feed_id !== String(scValToNative(args[1])) ||
+      event.fields.price !== String(scValToNative(args[2])) ||
+      event.fields.submitter !== scValToNative(args[0])
+    )
+      throw new OracleVerificationError(
+        "PAYLOAD_MISMATCH",
+        "Oracle price event differs from the submit_price invocation",
+      );
+    return event;
   }
 }

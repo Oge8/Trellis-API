@@ -15,6 +15,11 @@ import {
   MAX_BULK_DEAD_LETTER_RETRY,
   ScheduleRetryDto,
 } from "./dto/schedule-retry.dto";
+import {
+  getCorrelationId,
+  normalizeCorrelationId,
+} from "../../common/correlation/correlation-context";
+import { sanitizeErrorMessage } from "../../logging/sanitize.util";
 
 export interface ScheduleRetryOpts {
   operationType: string;
@@ -73,7 +78,10 @@ export class RetrySchedulerService {
       backoffMultiplier: opts.backoffMultiplier ?? 2,
       maxBackoffMs: opts.maxBackoffMs ?? 60000,
       retryable: opts.retryable ?? true,
-      correlationId: opts.correlationId ?? null,
+      // An explicit ID wins; otherwise the scheduling request's ID is kept so
+      // every later attempt can be traced back to it (#270).
+      correlationId:
+        normalizeCorrelationId(opts.correlationId) ?? getCorrelationId() ?? null,
       metadata: opts.metadata ?? null,
       status: RetryOperationStatus.PENDING,
       nextRetryAt: new Date(),
@@ -119,8 +127,10 @@ export class RetrySchedulerService {
     });
     if (!operation) return null;
 
+    // lastError is served by the failure dashboard and dead-letter listing.
+    const reason = sanitizeErrorMessage(String(error ?? ""));
     operation.attempts += 1;
-    operation.lastError = error;
+    operation.lastError = reason;
 
     if (!retryable || !operation.retryable) {
       return this.moveToDeadLetter(operation, "Non-retryable failure", false);
@@ -143,7 +153,8 @@ export class RetrySchedulerService {
       attempts: saved.attempts,
       maxAttempts: saved.maxAttempts,
       nextRetryAt: saved.nextRetryAt,
-      error,
+      error: reason,
+      correlationId: saved.correlationId,
     });
 
     const nextAt = saved.nextRetryAt instanceof Date
@@ -462,6 +473,7 @@ export class RetrySchedulerService {
       attempts: saved.attempts,
       lastError: saved.lastError,
       reason,
+      correlationId: saved.correlationId,
     });
 
     this.logger.warn(
