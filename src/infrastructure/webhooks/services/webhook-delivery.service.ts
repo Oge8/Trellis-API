@@ -18,6 +18,15 @@ import {
   DestinationAllowListService,
   DestinationNotAllowedError,
 } from "../../../common/validators/allow-list/destination-allow-list";
+import {
+  getCorrelationId,
+  normalizeCorrelationId,
+  withCorrelationHeaders,
+} from "../../../common/correlation/correlation-context";
+import {
+  sanitizeErrorMessage,
+  sanitizeHeaders,
+} from "../../../logging/sanitize.util";
 
 export interface DeliveryResult {
   statusCode?: number;
@@ -95,12 +104,16 @@ export class WebhookDeliveryService {
     subscriptions: WebhookSubscription[],
   ): Promise<WebhookDelivery[]> {
     const deliveries: WebhookDelivery[] = [];
+    // Pinned at creation so every attempt, including retries run later by the
+    // queue worker, sends the ID of the request that raised the event (#270).
+    const correlationId = getCorrelationId();
     for (const sub of subscriptions) {
       const delivery = this.deliveryRepo.create({
         subscriptionId: sub.id,
         eventId: event.id,
         status: WebhookDeliveryStatus.PENDING,
         maxAttempts: sub.maxRetries,
+        ...(correlationId && { metadata: { correlationId } }),
       });
       const saved = await this.deliveryRepo.save(delivery);
       deliveries.push(saved);
@@ -158,17 +171,23 @@ export class WebhookDeliveryService {
       attempt: delivery.attempts + 1,
     });
 
-    const headers = this.hmacService.buildSignedHeaders(
-      subscription.signingKey,
-      payload,
-      event.id,
-      event.eventType,
-      subscription.headers,
+    const headers = withCorrelationHeaders(
+      this.hmacService.buildSignedHeaders(
+        subscription.signingKey,
+        payload,
+        event.id,
+        event.eventType,
+        subscription.headers,
+      ),
+      normalizeCorrelationId(delivery.metadata?.correlationId) ??
+        getCorrelationId(),
     );
 
-    // Update delivery status to delivering
+    // Update delivery status to delivering. The stored copy is what the
+    // delivery and dead-letter APIs return, so subscriber-supplied credentials
+    // (Authorization, X-Api-Key, ...) are redacted; the live request keeps them.
     delivery.status = WebhookDeliveryStatus.DELIVERING;
-    delivery.requestHeaders = headers;
+    delivery.requestHeaders = sanitizeHeaders(headers) as Record<string, string>;
     delivery.lastAttemptAt = new Date();
     await this.deliveryRepo.save(delivery);
 
@@ -214,7 +233,7 @@ export class WebhookDeliveryService {
       const durationMs = Date.now() - startTime;
       return {
         durationMs,
-        error: err.message || "Unknown delivery error",
+        error: sanitizeErrorMessage(err.message || "Unknown delivery error"),
       };
     }
   }
@@ -391,12 +410,20 @@ export class WebhookDeliveryService {
       return null;
     }
 
-    // Create a fresh delivery
+    // Create a fresh delivery that keeps the original correlation ID, so a
+    // replayed dead letter is still traceable to the request that caused it.
+    const original = await this.deliveryRepo.findOne({
+      where: { id: dl.deliveryId },
+    });
+    const correlationId =
+      normalizeCorrelationId(original?.metadata?.correlationId) ??
+      getCorrelationId();
     const newDelivery = this.deliveryRepo.create({
       subscriptionId: dl.subscriptionId,
       eventId: dl.eventId,
       status: WebhookDeliveryStatus.PENDING,
       maxAttempts: subscription.maxRetries,
+      ...(correlationId && { metadata: { correlationId } }),
     });
     const saved = await this.deliveryRepo.save(newDelivery);
 
